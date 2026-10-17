@@ -1,4 +1,4 @@
-name: AmSECT Job Alerts
+name: AmSECT Job Alerts Daily
 
 on:
   schedule:

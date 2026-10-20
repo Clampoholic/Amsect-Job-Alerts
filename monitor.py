@@ -1,112 +1,90 @@
 import json
 import os
 import re
-import subprocess
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
 PAGE_URL = "https://amsect.org/members/job-opportunities"
-STATE_PATH = Path("seen_jobs.json")
-WEBHOOK = os.environ["DISCORD_WEBHOOK_URL"]
+STATE_FILE = Path("seen_jobs.json")
 
-def clean(text):
-    return re.sub(r"\s+", " ", text or "").strip()
 
-def extract_jobs(html):
+def get_webhook():
+    url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
+    if not url:
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL is empty. Check that monitor.yml maps "
+            "DISCORD_WEBHOOK_URL to secrets.AMSECTPOSTINGS, and that "
+            "AMSECTPOSTINGS contains the full Discord webhook URL."
+        )
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or parsed.netloc not in {
+        "discord.com", "discordapp.com", "canary.discord.com", "ptb.discord.com"
+    } or not parsed.path.startswith("/api/webhooks/"):
+        raise RuntimeError(
+            "DISCORD_WEBHOOK_URL is not a valid Discord webhook URL. "
+            "It should begin with https://discord.com/api/webhooks/"
+        )
+    print("Discord webhook configuration verified (URL hidden).")
+    return url
+
+
+def find_jobs(html):
     soup = BeautifulSoup(html, "html.parser")
     jobs = {}
-    for a in soup.find_all("a", href=True):
-        title = clean(a.get_text(" ", strip=True))
-        href = urljoin(PAGE_URL, a["href"])
-
-        # Individual AmSECT job-detail pages use this URL path.
-        if "/members/job-opportunities/" not in href.lower():
+    for link in soup.find_all("a", href=True):
+        title = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip()
+        url = urljoin(PAGE_URL, link["href"])
+        parsed = urlparse(url)
+        if parsed.netloc.lower() not in {"amsect.org", "www.amsect.org"}:
             continue
-        if href.rstrip("/").lower() == PAGE_URL.rstrip("/").lower():
+        if not parsed.path.lower().startswith("/members/job-opportunities/"):
             continue
         if not title or title.lower() in {"next", "last", "1", "2", "3"}:
             continue
-
-        # Capture the surrounding listing card/text for location and posting date.
-        parent = a
-        for _ in range(4):
-            if parent.parent:
-                parent = parent.parent
-        context = clean(parent.get_text(" ", strip=True))
-        context = context.replace(title, "", 1).strip(" |•-")
-        # Avoid including unrelated text if the parent container is too broad.
-        location = ""
-        date = ""
-        date_match = re.search(
-            r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday), "
-            r"[A-Z][a-z]+ \d{1,2}, \d{4}", context
-        )
-        if date_match:
-            date = date_match.group(0)
-            context = clean(context.replace(date, ""))
-        if context and len(context) < 120:
-            location = context
-
-        key = href.rstrip("/")
-        jobs[key] = {
-            "title": title,
-            "url": href,
-            "location": location or "See listing",
-            "date": date or "See listing",
-        }
+        jobs[url.rstrip("/")] = {"title": title, "url": url}
     return jobs
 
-def send_discord(job):
-    message = (
-        f"🫀 **New AmSECT Job Posting**\n"
-        f"**{job['title']}**\n"
-        f"📍 {job['location']}\n"
-        f"🗓️ {job['date']}\n"
-        f"🔗 {job['url']}"
-    )
-    response = requests.post(
-        WEBHOOK,
-        json={"content": message, "allowed_mentions": {"parse": []}},
-        timeout=20,
-    )
-    response.raise_for_status()
 
 def main():
+    webhook = get_webhook()
     response = requests.get(
         PAGE_URL,
         headers={"User-Agent": "Mozilla/5.0 (compatible; AmSECTJobAlert/1.0)"},
         timeout=30,
     )
     response.raise_for_status()
-    current = extract_jobs(response.text)
-    if not current:
+    jobs = find_jobs(response.text)
+    print(f"Found {len(jobs)} AmSECT job links.")
+    if not jobs:
         raise RuntimeError(
-            "No job links were detected. The page structure may have changed; "
-            "stopping so the saved baseline is not overwritten."
+            "No individual job links found on AmSECT. The page layout or "
+            "job URL pattern may have changed. No saved data was changed."
         )
 
-    old = {}
-    if STATE_PATH.exists():
-        old = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-
-    # First run seeds the baseline without posting every existing listing.
-    if not old:
-        STATE_PATH.write_text(json.dumps(current, indent=2), encoding="utf-8")
-        print(f"Initialized baseline with {len(current)} existing listings; no alerts sent.")
+    if not STATE_FILE.exists():
+        STATE_FILE.write_text(json.dumps(jobs, indent=2), encoding="utf-8")
+        print("First run: saved existing jobs as baseline; no alerts sent.")
         return
 
-    new_jobs = [job for key, job in current.items() if key not in old]
-    # Send alerts before updating state so a failed Discord post can retry next run.
+    seen = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    new_jobs = [job for key, job in jobs.items() if key not in seen]
     for job in reversed(new_jobs):
-        send_discord(job)
-        print(f"Alerted: {job['title']} — {job['url']}")
+        content = f"ð« **New AmSECT Job Posting**\n**{job['title']}**\n{job['url']}"
+        result = requests.post(
+            webhook,
+            json={"content": content, "allowed_mentions": {"parse": []}},
+            timeout=20,
+        )
+        result.raise_for_status()
+        print(f"Sent Discord alert: {job['title']}")
 
-    merged = {**old, **current}
-    STATE_PATH.write_text(json.dumps(merged, indent=2), encoding="utf-8")
-    print(f"Checked {len(current)} current listings; {len(new_jobs)} new listing(s).")
+    seen.update(jobs)
+    STATE_FILE.write_text(json.dumps(seen, indent=2), encoding="utf-8")
+    print(f"Finished: {len(new_jobs)} new jobs; {len(jobs)} current jobs.")
+
 
 if __name__ == "__main__":
     main()

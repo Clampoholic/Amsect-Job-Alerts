@@ -22,7 +22,7 @@ jobs:
         run: pip install requests beautifulsoup4
       - name: Run job monitor
         env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.AMSECTPOSTINGS }}
         run: python monitor.py
       - name: Save seen jobs
         run: |
